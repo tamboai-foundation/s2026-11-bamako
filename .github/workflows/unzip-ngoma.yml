@@ -1,0 +1,141 @@
+# .github/workflows/unzip-ngoma.yml
+#
+# Décompresse NGOMA.zip dans le dépôt GitHub et commite le résultat.
+#
+# Déclenchement :
+#   - automatique : à chaque push sur main qui ajoute ou modifie NGOMA.zip ;
+#   - manuel      : onglet Actions > « Décompresser NGOMA.zip » > Run workflow.
+#
+# Garde-fous : archive testée, chemins dangereux (« zip slip ») et liens symboliques
+# refusés, scan de secrets AVANT toute copie dans le dépôt, workflows jamais écrasés.
+# Aucun secret n'est requis : le GITHUB_TOKEN fourni par GitHub suffit.
+
+name: Décompresser NGOMA.zip
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "NGOMA.zip"
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "Chemin de l'archive dans le dépôt"
+        required: false
+        default: "NGOMA.zip"
+      supprimer_archive:
+        description: "Supprimer l'archive du dépôt après extraction"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unzip-ngoma-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCHIVE: ${{ inputs.archive || 'NGOMA.zip' }}
+  # Sur un push, l'archive est toujours supprimée (évite de la re-traiter et d'alourdir le dépôt).
+  DELETE_ARCHIVE: ${{ github.event_name == 'push' && 'true' || inputs.supprimer_archive }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  unzip:
+    name: Extraire et commiter
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Vérifier l'archive
+        run: |
+          set -euo pipefail
+          case "$ARCHIVE" in
+            /*|*..*) echo "::error::Chemin d'archive refusé : $ARCHIVE"; exit 1 ;;
+            *.zip)   ;;
+            *)       echo "::error::L'archive doit être un fichier .zip"; exit 1 ;;
+          esac
+          [ -f "$ARCHIVE" ] || { echo "::error::Archive introuvable : $ARCHIVE"; exit 1; }
+
+          # Intégrité (CRC) de l'archive
+          unzip -tq "$ARCHIVE"
+
+          # Chemins absolus ou remontants (zip slip)
+          if unzip -Z1 "$ARCHIVE" | grep -E '(^/|(^|/)\.\.(/|$))'; then
+            echo "::error::L'archive contient des chemins dangereux"; exit 1
+          fi
+          # Liens symboliques
+          if unzip -Z "$ARCHIVE" | grep -E '^l'; then
+            echo "::error::L'archive contient des liens symboliques"; exit 1
+          fi
+          echo "Archive valide : $(unzip -Z1 "$ARCHIVE" | wc -l) entrées"
+
+      - name: Extraire dans un dossier temporaire
+        run: |
+          set -euo pipefail
+          EXTRACT="$RUNNER_TEMP/ngoma-extract"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          unzip -q "$ARCHIVE" -d "$EXTRACT"
+
+          # NGOMA.zip contient un seul dossier racine (ngoma/) : on l'aplatit
+          # pour que le contenu arrive à la racine du dépôt.
+          mapfile -t TOP < <(find "$EXTRACT" -mindepth 1 -maxdepth 1)
+          if [ "${#TOP[@]}" -eq 1 ] && [ -d "${TOP[0]}" ]; then
+            SRC="${TOP[0]}"
+          else
+            SRC="$EXTRACT"
+          fi
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "Contenu extrait depuis : $SRC"
+
+      - name: Scanner les secrets (avant toute copie)
+        run: |
+          set -euo pipefail
+          # Scanner déjà présent dans le dépôt s'il existe, sinon celui de l'archive.
+          if [ -f tools/scan_secrets.py ]; then
+            SCANNER="tools/scan_secrets.py"
+          else
+            SCANNER="$SRC/tools/scan_secrets.py"
+          fi
+          if [ -f "$SCANNER" ]; then
+            python3 -I "$SCANNER" "$SRC"
+          else
+            echo "::warning::scan_secrets.py introuvable : contrôle ignoré"
+          fi
+
+      - name: Copier dans le dépôt
+        run: |
+          set -euo pipefail
+          # .git : jamais touché. .github/workflows : le GITHUB_TOKEN n'a pas le droit
+          # de les modifier, et l'archive ne doit pas pouvoir réécrire ce workflow.
+          tar -C "$SRC" \
+              --exclude='./.git' \
+              --exclude='./.github/workflows' \
+              -cf - . | tar -xf - -C .
+
+      - name: Commiter et pousser
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "$DELETE_ARCHIVE" = "true" ]; then
+            git rm -q --ignore-unmatch -- "$ARCHIVE"
+          fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Aucun changement à commiter."
+            exit 0
+          fi
+
+          git commit -m "chore: extraction de ${ARCHIVE}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
