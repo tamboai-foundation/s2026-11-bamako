@@ -1,0 +1,26 @@
+name: Décompresser NGOMA.zip
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'NGOMA.zip'
+      - '.github/workflows/unzip-ngoma.yml'
+
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: Chemin de l'archive ZIP
+        required: true
+        default: NGOMA.zip
+        type: string
+
+      supprimer_archive:
+        description: Supprimer l'archive après extraction
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
